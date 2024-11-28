@@ -3,6 +3,7 @@ import torch.distributed as dist
 from typing import Optional
 import math
 import torch.nn as nn
+import torch.distributed.nn.functional as distF
 
 def initialize_parallel_env():
     """Initialize the distributed environment."""
@@ -26,8 +27,7 @@ def split_tensor_along_last_dim(tensor: torch.Tensor, num_partitions: int):
     return torch.split(tensor, last_dim_size, dim=last_dim)
 
 class ColumnParallelLinear(nn.Module):
-    """Linear layer with column parallelism.
-    The linear layer is divided along the output dimension."""
+    """Linear layer with column parallelism."""
     def __init__(self, in_features, out_features, bias=True):
         super().__init__()
         
@@ -54,8 +54,10 @@ class ColumnParallelLinear(nn.Module):
         if self.world_size == 1:
             return local_out
             
-        # Gather outputs from all ranks
+        # Create list of tensors for gathering
         gather_list = [torch.zeros_like(local_out) for _ in range(self.world_size)]
+        
+        # All-gather operation
         dist.all_gather(gather_list, local_out)
         
         # Concatenate along feature dimension
@@ -63,8 +65,7 @@ class ColumnParallelLinear(nn.Module):
         return output
 
 class RowParallelLinear(nn.Module):
-    """Linear layer with row parallelism.
-    The linear layer is divided along the input dimension."""
+    """Linear layer with row parallelism."""
     def __init__(self, in_features, out_features, bias=True):
         super().__init__()
         
