@@ -41,12 +41,8 @@ class GPTModel(nn.Module):
     ):
         super().__init__()
         
-        # Pad vocab size to be divisible by world size
-        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        self.padded_vocab_size = ((vocab_size + world_size - 1) // world_size) * world_size
-        
         # Token and position embeddings
-        self.token_embedding = nn.Embedding(self.padded_vocab_size, d_model)
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.position_embedding = nn.Embedding(max_seq_len, d_model)
         
         # Register buffer for positional indices
@@ -61,16 +57,10 @@ class GPTModel(nn.Module):
         
         # Final layer norm and output projection
         self.ln_f = nn.LayerNorm(d_model)
-        self.output = ParallelLinear(d_model, self.padded_vocab_size)
-        
-        # Store original vocab size for masking
-        self.vocab_size = vocab_size
+        self.output = ParallelLinear(d_model, vocab_size)
         
         # Dropout
         self.dropout = nn.Dropout(dropout)
-        
-        # Loss function
-        self.loss_fct = nn.CrossEntropyLoss()
         
         # Initialize weights
         self.apply(self._init_weights)
@@ -88,44 +78,41 @@ class GPTModel(nn.Module):
         # Get sequence length and create attention mask
         batch_size, seq_len = input_ids.size()
         
-        # Create causal mask [batch_size, seq_len, seq_len]
+        # Create causal mask [seq_len, seq_len]
         mask = torch.triu(
             torch.ones((seq_len, seq_len), dtype=torch.bool, device=input_ids.device),
             diagonal=1
-        ).expand(batch_size, seq_len, seq_len)
+        )
         
         # Get embeddings
         token_embeds = self.token_embedding(input_ids)  # [batch_size, seq_len, d_model]
         pos_embeds = self.position_embedding(self.pos_indices[:seq_len])  # [seq_len, d_model]
         
         # Combine embeddings
-        hidden_states = self.dropout(token_embeds + pos_embeds.unsqueeze(0))  # [batch_size, seq_len, d_model]
+        x = self.dropout(token_embeds + pos_embeds.unsqueeze(0))  # [batch_size, seq_len, d_model]
         
         # Apply transformer blocks
         for block in self.blocks:
-            hidden_states = block(hidden_states, mask=mask)
+            x = block(x, mask=mask)
         
         # Final layer norm and output projection
-        hidden_states = self.ln_f(hidden_states)
-        logits = self.output(hidden_states)
-        
-        # Mask out padding tokens in vocab
-        if self.vocab_size < self.padded_vocab_size:
-            logits[..., self.vocab_size:] = float('-inf')
-        
-        outputs = {'logits': logits}
+        x = self.ln_f(x)
+        logits = self.output(x)  # [batch_size, seq_len, vocab_size]
         
         # Calculate loss if labels are provided
         if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            # Ensure inputs to loss function require gradients
+            logits = logits.view(-1, logits.size(-1))  # [batch_size * seq_len, vocab_size]
+            labels = labels.view(-1)  # [batch_size * seq_len]
             
-            # Flatten the tokens
-            loss = self.loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1)
-            )
-            outputs['loss'] = loss
+            # CrossEntropyLoss automatically creates gradients
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits, labels)
+            
+            # Ensure loss requires gradients
+            if not loss.requires_grad:
+                loss.requires_grad_(True)
+            
+            return type('ModelOutput', (), {'loss': loss, 'logits': logits.view(batch_size, seq_len, -1)})()
         
-        return type('ModelOutput', (), outputs)() 
+        return logits 

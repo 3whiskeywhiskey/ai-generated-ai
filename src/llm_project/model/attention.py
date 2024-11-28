@@ -1,68 +1,64 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import math
-from .parallel_utils import ColumnParallelLinear, RowParallelLinear
+from .parallel_utils import ParallelLinear
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, n_heads, dropout=0.1):
+    def __init__(self, d_model, n_heads):
         super().__init__()
-        assert d_model % n_heads == 0, f"d_model ({d_model}) must be divisible by n_heads ({n_heads})"
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         
-        # Get world size for model parallelism
-        self.world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        self.rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        
-        # Model dimensions
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
         
-        # Linear layers for parallel processing
-        self.q_proj = ColumnParallelLinear(d_model, d_model)
-        self.k_proj = ColumnParallelLinear(d_model, d_model)
-        self.v_proj = ColumnParallelLinear(d_model, d_model)
-        self.out_proj = RowParallelLinear(d_model, d_model)
+        # Create query, key, value projections
+        self.q_proj = ParallelLinear(d_model, d_model)
+        self.k_proj = ParallelLinear(d_model, d_model)
+        self.v_proj = ParallelLinear(d_model, d_model)
         
-        self.dropout = nn.Dropout(dropout)
+        # Output projection
+        self.out_proj = ParallelLinear(d_model, d_model)
+        
+        # Dropout
+        self.dropout = nn.Dropout(0.1)
+        
+        # Scaling factor
         self.scale = math.sqrt(self.d_head)
         
     def forward(self, x, mask=None):
-        batch_size, seq_len, _ = x.shape
+        batch_size, seq_len, _ = x.size()
         
-        # Project to Q, K, V
-        q = self.q_proj(x)  # [batch, seq, d_model]
-        k = self.k_proj(x)  # [batch, seq, d_model]
-        v = self.v_proj(x)  # [batch, seq, d_model]
+        # Project queries, keys, values
+        q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.d_head)
+        k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.d_head)
+        v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.d_head)
         
-        # Reshape: [batch, seq, n_heads, d_head]
-        q = q.view(batch_size, seq_len, self.n_heads, self.d_head)
-        k = k.view(batch_size, seq_len, self.n_heads, self.d_head)
-        v = v.view(batch_size, seq_len, self.n_heads, self.d_head)
-        
-        # Transpose: [batch, n_heads, seq, d_head]
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        # Transpose for attention computation
+        q = q.transpose(1, 2)  # [batch_size, n_heads, seq_len, d_head]
+        k = k.transpose(1, 2)  # [batch_size, n_heads, seq_len, d_head]
+        v = v.transpose(1, 2)  # [batch_size, n_heads, seq_len, d_head]
         
         # Compute attention scores
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / self.scale
+        scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale  # [batch_size, n_heads, seq_len, seq_len]
         
+        # Apply mask if provided
         if mask is not None:
-            mask = mask.unsqueeze(1)  # [batch, 1, seq, seq]
-            attn_weights = attn_weights.masked_fill(mask == 0, float('-inf'))
+            # Expand mask for batch size and heads
+            # mask shape: [seq_len, seq_len] -> [1, 1, seq_len, seq_len]
+            mask = mask.unsqueeze(0).unsqueeze(0)
+            scores = scores.masked_fill(mask, float('-inf'))
         
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = self.dropout(attn_weights)
+        # Apply softmax and dropout
+        attn = torch.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
         
-        # Apply attention to values
-        attn_output = torch.matmul(attn_weights, v)  # [batch, n_heads, seq, d_head]
+        # Compute output
+        out = torch.matmul(attn, v)  # [batch_size, n_heads, seq_len, d_head]
+        out = out.transpose(1, 2)  # [batch_size, seq_len, n_heads, d_head]
+        out = out.reshape(batch_size, seq_len, self.d_model)
         
-        # Reshape back: [batch, seq, d_model]
-        attn_output = attn_output.transpose(1, 2).contiguous()  # [batch, seq, n_heads, d_head]
-        attn_output = attn_output.view(batch_size, seq_len, self.d_model)
+        # Final output projection
+        out = self.out_proj(out)
         
-        # Final projection
-        output = self.out_proj(attn_output)
-        
-        return output
+        return out 

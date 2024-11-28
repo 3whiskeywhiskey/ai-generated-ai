@@ -1,41 +1,45 @@
 import torch
-from llm_project.model.model import GPTModel
+from llm_project.model.config import ModelConfig
+from llm_project.model.model import LLM
 
 def test_model_simple(debug=True):
-    """Test the model without distributed setup."""
     # Create a small test config
-    model = GPTModel(
-        vocab_size=50304,  # GPT-NeoX tokenizer vocab size
-        max_seq_len=16,
+    config = ModelConfig(
         n_layers=2,
-        n_heads=4,
-        d_model=128,
-        d_ff=512,
-        dropout=0.1
+        n_heads=8,
+        d_model=512,
+        d_ff=2048,
+        vocab_size=1000,
+        max_seq_length=128
     )
+    
+    # Create model
+    model = LLM(config)
     
     # Create sample input
     batch_size = 2
     seq_length = 16
-    input_ids = torch.randint(0, 50304, (batch_size, seq_length))
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_length))
+    attention_mask = torch.ones_like(input_ids)
     
     # Move to GPU if available
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = model.to(device)
     input_ids = input_ids.to(device)
+    attention_mask = attention_mask.to(device)
     
     if debug:
         print(f"\nModel configuration:")
         print(f"Device: {device}")
-        print(f"Number of heads: {model.blocks[0].attn.n_heads}")
-        print(f"Head dimension: {model.blocks[0].attn.d_head}")
+        print(f"Number of heads: {config.n_heads}")
+        print(f"Head dimension: {model.blocks[0].attn.head_dim}")
         
         # Get embeddings and debug shapes
         with torch.no_grad():
             # Get embeddings
-            token_embeds = model.token_embedding(input_ids)
-            pos_embeds = model.position_embedding(model.pos_indices[:seq_length])
-            hidden_states = token_embeds + pos_embeds.unsqueeze(0)
+            inputs_embeds = model.wte(input_ids)
+            position_embeds = model.wpe(torch.arange(0, seq_length, dtype=torch.long, device=device))
+            hidden_states = inputs_embeds + position_embeds
             
             # Debug attention shapes
             attn = model.blocks[0].attn
@@ -51,9 +55,9 @@ def test_model_simple(debug=True):
             print(f"V projection shape: {v.shape}")
             
             # Debug attention computation
-            q_reshaped = q.view(batch_size, seq_length, attn.n_heads, attn.d_head).transpose(1, 2)
-            k_reshaped = k.view(batch_size, seq_length, attn.n_heads, attn.d_head).transpose(1, 2)
-            v_reshaped = v.view(batch_size, seq_length, attn.n_heads, attn.d_head).transpose(1, 2)
+            q_reshaped = q.view(batch_size, seq_length, config.n_heads, -1).transpose(1, 2)
+            k_reshaped = k.view(batch_size, seq_length, config.n_heads, -1).transpose(1, 2)
+            v_reshaped = v.view(batch_size, seq_length, config.n_heads, -1).transpose(1, 2)
             
             print("\nReshaped attention tensors:")
             print(f"Q reshaped: {q_reshaped.shape}")
@@ -61,22 +65,26 @@ def test_model_simple(debug=True):
             print(f"V reshaped: {v_reshaped.shape}")
             
             # Test attention computation shapes
-            attn_weights = torch.matmul(q_reshaped, k_reshaped.transpose(-2, -1)) / attn.scale
-            print(f"Attention weights shape: {attn_weights.shape}")
+            attn_weights = torch.matmul(q_reshaped, k_reshaped.transpose(-2, -1)) / model.blocks[0].attn.scale
+            print(f"Attention weights shape: {attn_weights.shape}")  # Should be [2, 8, 16, 16]
             
             attn_output = torch.matmul(attn_weights, v_reshaped)
-            print(f"Attention output shape: {attn_output.shape}")
+            print(f"Attention output shape: {attn_output.shape}")  # Should be [2, 8, 16, 64]
             
             # Test final reshape
-            attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_length, attn.d_model)
-            print(f"Final attention output shape: {attn_output.shape}")
+            attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_length, config.d_model)
+            print(f"Final attention output shape: {attn_output.shape}")  # Should be [2, 16, 512]
     
     # Forward pass
     with torch.no_grad():
-        outputs = model(input_ids)
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
     
     # Basic shape tests
-    assert outputs.logits.shape == (batch_size, seq_length, 50304)
+    assert outputs['logits'].shape == (batch_size, seq_length, config.vocab_size)
+    assert outputs['hidden_states'].shape == (batch_size, seq_length, config.d_model)
     
     print("\nAll tests passed!")
     return outputs
