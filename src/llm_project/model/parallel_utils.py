@@ -25,87 +25,79 @@ def split_tensor_along_last_dim(tensor: torch.Tensor, num_partitions: int):
     last_dim_size = tensor.size()[last_dim] // num_partitions
     return torch.split(tensor, last_dim_size, dim=last_dim)
 
-class ColumnParallelLinear(torch.nn.Module):
-    """Linear layer with column parallelism."""
-    def __init__(self, input_size: int, output_size: int, bias: bool = True):
+class ColumnParallelLinear(nn.Module):
+    """Linear layer with column parallelism.
+    The linear layer is divided along the output dimension."""
+    def __init__(self, in_features, out_features, bias=True):
         super().__init__()
-        self.input_size = input_size
-        self.world_size, self.rank = get_parallel_ranks()
         
-        # Split output size across GPUs
-        self.output_size_per_partition = output_size // self.world_size
-        assert output_size % self.world_size == 0, \
-            f"Output size {output_size} must be divisible by world size {self.world_size}"
+        # Initialize process group if not already done
+        if not dist.is_initialized():
+            self.world_size = 1
+            self.rank = 0
+        else:
+            self.world_size = dist.get_world_size()
+            self.rank = dist.get_rank()
+            
+        # Split the output features across GPUs
+        self.output_per_rank = out_features // self.world_size
+        assert out_features % self.world_size == 0, \
+            f"Output features ({out_features}) must be divisible by world size ({self.world_size})"
         
         # Create local linear layer
-        self.linear = torch.nn.Linear(input_size, self.output_size_per_partition, bias=bias)
+        self.linear = nn.Linear(in_features, self.output_per_rank, bias=bias)
         
-        # Initialize with different seeds per rank
-        if dist.is_initialized():
-            torch.manual_seed(42 + self.rank)
-            self.linear.weight.data.normal_(mean=0.0, std=0.02)
-            if bias:
-                self.linear.bias.data.zero_()
+    def forward(self, x):
+        # Local forward pass
+        local_out = self.linear(x)  # [*, local_dim]
         
-    def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        # Local computation
-        local_output = self.linear(input_)
-        
-        if dist.is_initialized():
-            # Gather outputs from all GPUs
-            output_list = [torch.empty_like(local_output) for _ in range(self.world_size)]
-            dist.all_gather(output_list, local_output)
-            output = torch.cat(output_list, dim=-1)
-        else:
-            output = local_output
+        if self.world_size == 1:
+            return local_out
             
+        # Gather outputs from all ranks
+        gather_list = [torch.zeros_like(local_out) for _ in range(self.world_size)]
+        dist.all_gather(gather_list, local_out)
+        
+        # Concatenate along feature dimension
+        output = torch.cat(gather_list, dim=-1)
         return output
 
-class RowParallelLinear(torch.nn.Module):
-    """Linear layer with row parallelism."""
-    def __init__(self, input_size: int, output_size: int, bias: bool = True):
+class RowParallelLinear(nn.Module):
+    """Linear layer with row parallelism.
+    The linear layer is divided along the input dimension."""
+    def __init__(self, in_features, out_features, bias=True):
         super().__init__()
-        self.input_size = input_size
-        self.output_size = output_size
-        self.world_size, self.rank = get_parallel_ranks()
         
-        # Split input size across GPUs
-        self.input_size_per_partition = input_size // self.world_size
-        assert input_size % self.world_size == 0, \
-            f"Input size {input_size} must be divisible by world size {self.world_size}"
+        # Initialize process group if not already done
+        if not dist.is_initialized():
+            self.world_size = 1
+            self.rank = 0
+        else:
+            self.world_size = dist.get_world_size()
+            self.rank = dist.get_rank()
+            
+        # Split the input features across GPUs
+        self.input_per_rank = in_features // self.world_size
+        assert in_features % self.world_size == 0, \
+            f"Input features ({in_features}) must be divisible by world size ({self.world_size})"
         
-        # Create local linear layer - note transposed dimensions
-        self.linear = torch.nn.Linear(self.input_size_per_partition, output_size, bias=bias and self.rank == 0)
+        # Create local linear layer
+        self.linear = nn.Linear(self.input_per_rank, out_features, bias=bias and self.rank == 0)
         
-        # Initialize with different seeds per rank
-        if dist.is_initialized():
-            torch.manual_seed(42 + self.rank)
-            self.linear.weight.data.normal_(mean=0.0, std=0.02)
-            if bias and self.rank == 0:
-                self.linear.bias.data.zero_()
+    def forward(self, x):
+        # Split input along feature dimension
+        input_list = list(x.chunk(self.world_size, dim=-1))
+        local_input = input_list[self.rank]
         
-    def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        # Input shape: [batch_size, seq_len, input_size_per_partition]
-        batch_size, seq_len, _ = input_.size()
+        # Local forward pass
+        local_out = self.linear(local_input)
         
-        # Verify input size
-        assert input_.size(-1) == self.input_size_per_partition, \
-            f"Expected input size {self.input_size_per_partition}, got {input_.size(-1)}"
-        
-        # Reshape for linear layer
-        input_2d = input_.reshape(-1, self.input_size_per_partition)
-        
-        # Local computation
-        local_output = self.linear(input_2d)  # [-1, output_size]
-        
-        if dist.is_initialized():
-            # All-reduce across GPUs
-            dist.all_reduce(local_output, op=dist.ReduceOp.SUM)
-        
-        # Restore batch dimension
-        output = local_output.reshape(batch_size, seq_len, self.output_size)
-        
-        return output
+        if self.world_size == 1:
+            return local_out
+            
+        # All-reduce across GPUs
+        dist.all_reduce(local_out, op=dist.ReduceOp.SUM)
+        return local_out
 
 class ParallelLinear(nn.Module):
     """Linear layer with model parallelism."""
@@ -125,48 +117,42 @@ class ParallelLinear(nn.Module):
             
         # Split the output features across GPUs
         self.output_per_rank = out_features // self.world_size
-        assert out_features % self.world_size == 0, f"Output features ({out_features}) must be divisible by world size ({self.world_size})"
+        assert out_features % self.world_size == 0, \
+            f"Output features ({out_features}) must be divisible by world size ({self.world_size})"
         
         # Create local linear layer
         self.linear = nn.Linear(in_features, self.output_per_rank, bias=True)
         
     def forward(self, x):
-        # Ensure input is contiguous
-        x = x.contiguous()
-        orig_shape = x.shape
+        batch_size = x.size(0)
+        seq_len = x.size(1) if len(x.shape) > 2 else 1
         
         # Reshape input if needed
-        if len(orig_shape) > 2:
-            x = x.view(-1, self.in_features)
-            
+        if len(x.shape) > 2:
+            x = x.reshape(-1, self.in_features)
+        
         # Local forward pass
-        local_out = self.linear(x)  # [*, local_dim]
+        local_out = self.linear(x)  # [batch*seq, local_dim]
         
         if not self.gather_output or self.world_size == 1:
             # Reshape back if needed
-            if len(orig_shape) > 2:
-                local_out = local_out.view(*orig_shape[:-1], self.output_per_rank)
+            if seq_len > 1:
+                local_out = local_out.reshape(batch_size, seq_len, -1)
             return local_out
-            
-        # Parallel reduction for multi-GPU case
+        
+        # For multi-GPU case, use all_gather
         if self.world_size > 1:
-            # Allocate full output tensor
-            full_output = torch.zeros(
-                (*local_out.shape[:-1], self.out_features),
-                dtype=local_out.dtype,
-                device=local_out.device
-            )
+            # Create list of tensors for gathering
+            gather_list = [torch.zeros_like(local_out) for _ in range(self.world_size)]
             
-            # Place local output in the correct slice
-            start_idx = self.rank * self.output_per_rank
-            end_idx = start_idx + self.output_per_rank
-            full_output[..., start_idx:end_idx] = local_out
+            # All-gather operation
+            dist.all_gather(gather_list, local_out)
             
-            # All-reduce to combine results
-            dist.all_reduce(full_output, op=dist.ReduceOp.SUM)
+            # Concatenate along feature dimension
+            output = torch.cat(gather_list, dim=-1)
             
-            # Reshape if needed
-            if len(orig_shape) > 2:
-                full_output = full_output.view(*orig_shape[:-1], self.out_features)
-                
-            return full_output
+            # Reshape back if needed
+            if seq_len > 1:
+                output = output.reshape(batch_size, seq_len, -1)
+            
+            return output
