@@ -3,12 +3,12 @@ from typing import Optional
 
 @dataclass
 class ModelConfig:
-    n_layers: int = 32
-    n_heads: int = 24
-    d_model: int = 2560
-    d_ff: int = 10240
+    n_layer: int = 32
+    n_head: int = 24
+    n_embd: int = 2560
     vocab_size: int = 50257
-    max_seq_length: int = 2048
+    max_seq_len: int = 2048
+    n_positions: int = 2048
     dropout: float = 0.1
     layer_norm_epsilon: float = 1e-5
     initializer_range: float = 0.02

@@ -4,15 +4,15 @@ from .attention import MultiHeadAttention
 from .parallel_utils import ParallelLinear
 
 class GPTBlock(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
+    def __init__(self, n_embd, n_head, d_ff, dropout=0.1):
         super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
-        self.attn = MultiHeadAttention(d_model, n_heads)
-        self.ln2 = nn.LayerNorm(d_model)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.attn = MultiHeadAttention(n_embd, n_head)
+        self.ln2 = nn.LayerNorm(n_embd)
         self.ff = nn.Sequential(
-            ParallelLinear(d_model, d_ff),
+            ParallelLinear(n_embd, d_ff),
             nn.GELU(),
-            ParallelLinear(d_ff, d_model),
+            ParallelLinear(d_ff, n_embd),
             nn.Dropout(dropout)
         )
         self.dropout = nn.Dropout(dropout)
@@ -32,32 +32,35 @@ class GPTModel(nn.Module):
     def __init__(
         self,
         vocab_size,
+        n_positions,
+        n_embd,
+        n_layer,
+        n_head,
         max_seq_len,
-        n_layers,
-        n_heads,
-        d_model,
-        d_ff,
         dropout=0.1
     ):
         super().__init__()
         
         # Token and position embeddings
-        self.token_embedding = nn.Embedding(vocab_size, d_model)
-        self.position_embedding = nn.Embedding(max_seq_len, d_model)
+        self.token_embedding = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding = nn.Embedding(max_seq_len, n_embd)
         
         # Register buffer for positional indices
         pos_indices = torch.arange(max_seq_len)
         self.register_buffer("pos_indices", pos_indices)
         
+        # Calculate feed-forward dimension (4x embedding dim is standard)
+        d_ff = 4 * n_embd
+        
         # Transformer blocks
         self.blocks = nn.ModuleList([
-            GPTBlock(d_model, n_heads, d_ff, dropout)
-            for _ in range(n_layers)
+            GPTBlock(n_embd, n_head, d_ff, dropout)
+            for _ in range(n_layer)
         ])
         
         # Final layer norm and output projection
-        self.ln_f = nn.LayerNorm(d_model)
-        self.output = ParallelLinear(d_model, vocab_size)
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.output = ParallelLinear(n_embd, vocab_size)
         
         # Dropout
         self.dropout = nn.Dropout(dropout)
@@ -74,15 +77,27 @@ class GPTModel(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
     
-    def forward(self, input_ids, labels=None):
+    def forward(self, input_ids, attention_mask=None, labels=None):
         # Get sequence length and create attention mask
         batch_size, seq_len = input_ids.size()
         
         # Create causal mask [seq_len, seq_len]
-        mask = torch.triu(
+        causal_mask = torch.triu(
             torch.ones((seq_len, seq_len), dtype=torch.bool, device=input_ids.device),
             diagonal=1
         )
+        
+        # Combine with attention mask if provided
+        if attention_mask is not None:
+            # Convert attention_mask to float and unsqueeze for broadcasting
+            attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [batch_size, 1, 1, seq_len]
+            attention_mask = (1.0 - attention_mask) * torch.finfo(torch.float32).min
+            
+            # Combine with causal mask
+            causal_mask = causal_mask.unsqueeze(0)  # [1, seq_len, seq_len]
+            combined_mask = causal_mask | (attention_mask == torch.finfo(torch.float32).min)
+        else:
+            combined_mask = causal_mask
         
         # Get embeddings
         token_embeds = self.token_embedding(input_ids)  # [batch_size, seq_len, d_model]
@@ -93,7 +108,7 @@ class GPTModel(nn.Module):
         
         # Apply transformer blocks
         for block in self.blocks:
-            x = block(x, mask=mask)
+            x = block(x, mask=combined_mask)
         
         # Final layer norm and output projection
         x = self.ln_f(x)
@@ -113,6 +128,13 @@ class GPTModel(nn.Module):
             if not loss.requires_grad:
                 loss.requires_grad_(True)
             
-            return type('ModelOutput', (), {'loss': loss, 'logits': logits.view(batch_size, seq_len, -1)})()
+            return type('ModelOutput', (), {
+                'loss': loss,
+                'logits': logits.view(batch_size, seq_len, -1),
+                'hidden_states': x
+            })()
         
-        return logits 
+        return {
+            'logits': logits,
+            'hidden_states': x
+        }
