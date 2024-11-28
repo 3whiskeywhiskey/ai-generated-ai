@@ -120,7 +120,7 @@ class Trainer:
             
             # Log to console
             metrics_str = [f"{k}: {v:.4f}" for k, v in metrics.items()]
-            print(f"[Rank {self.rank}] Step {step} - " + " | ".join(metrics_str))
+            #print(f"[Rank {self.rank}] Step {step} - " + " | ".join(metrics_str))
             
             # Log to wandb
             if self.use_wandb:

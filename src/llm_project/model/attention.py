@@ -16,15 +16,9 @@ class MultiHeadAttention(nn.Module):
         # Model dimensions
         self.d_model = d_model
         self.n_heads = n_heads
-        self.n_heads_per_rank = n_heads // self.world_size
         self.d_head = d_model // n_heads
         
-        # Ensure n_heads is divisible by world_size
-        assert n_heads % self.world_size == 0, \
-            f"n_heads ({n_heads}) must be divisible by world_size ({self.world_size})"
-        
         # Linear layers for parallel processing
-        # Each projection produces [batch, seq, d_model] after gathering
         self.q_proj = ColumnParallelLinear(d_model, d_model)
         self.k_proj = ColumnParallelLinear(d_model, d_model)
         self.v_proj = ColumnParallelLinear(d_model, d_model)
@@ -36,12 +30,12 @@ class MultiHeadAttention(nn.Module):
     def forward(self, x, mask=None):
         batch_size, seq_len, _ = x.shape
         
-        # Project to Q, K, V - each projection produces [batch, seq, d_model]
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        # Project to Q, K, V
+        q = self.q_proj(x)  # [batch, seq, d_model]
+        k = self.k_proj(x)  # [batch, seq, d_model]
+        v = self.v_proj(x)  # [batch, seq, d_model]
         
-        # Split heads: [batch, seq, n_heads, d_head]
+        # Reshape: [batch, seq, n_heads, d_head]
         q = q.view(batch_size, seq_len, self.n_heads, self.d_head)
         k = k.view(batch_size, seq_len, self.n_heads, self.d_head)
         v = v.view(batch_size, seq_len, self.n_heads, self.d_head)
@@ -55,7 +49,6 @@ class MultiHeadAttention(nn.Module):
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) / self.scale
         
         if mask is not None:
-            # Expand mask for attention heads
             mask = mask.unsqueeze(1)  # [batch, 1, seq, seq]
             attn_weights = attn_weights.masked_fill(mask == 0, float('-inf'))
         
@@ -65,7 +58,7 @@ class MultiHeadAttention(nn.Module):
         # Apply attention to values
         attn_output = torch.matmul(attn_weights, v)  # [batch, n_heads, seq, d_head]
         
-        # Reshape: [batch, seq, d_model]
+        # Reshape back: [batch, seq, d_model]
         attn_output = attn_output.transpose(1, 2).contiguous()  # [batch, seq, n_heads, d_head]
         attn_output = attn_output.view(batch_size, seq_len, self.d_model)
         
