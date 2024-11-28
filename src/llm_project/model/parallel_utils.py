@@ -131,35 +131,42 @@ class ParallelLinear(nn.Module):
         self.linear = nn.Linear(in_features, self.output_per_rank, bias=True)
         
     def forward(self, x):
-        # Local forward pass
-        local_out = self.linear(x)  # [batch, seq, local_dim]
+        # Ensure input is contiguous
+        x = x.contiguous()
+        orig_shape = x.shape
         
-        if not self.gather_output:
+        # Reshape input if needed
+        if len(orig_shape) > 2:
+            x = x.view(-1, self.in_features)
+            
+        # Local forward pass
+        local_out = self.linear(x)  # [*, local_dim]
+        
+        if not self.gather_output or self.world_size == 1:
+            # Reshape back if needed
+            if len(orig_shape) > 2:
+                local_out = local_out.view(*orig_shape[:-1], self.output_per_rank)
             return local_out
             
-        # Gather outputs from all ranks
+        # Parallel reduction for multi-GPU case
         if self.world_size > 1:
-            try:
-                # Create list of tensors for gathering
-                output_list = []
-                for i in range(self.world_size):
-                    if i == self.rank:
-                        output_list.append(local_out)
-                    else:
-                        output_list.append(torch.zeros_like(local_out))
+            # Allocate full output tensor
+            full_output = torch.zeros(
+                (*local_out.shape[:-1], self.out_features),
+                dtype=local_out.dtype,
+                device=local_out.device
+            )
+            
+            # Place local output in the correct slice
+            start_idx = self.rank * self.output_per_rank
+            end_idx = start_idx + self.output_per_rank
+            full_output[..., start_idx:end_idx] = local_out
+            
+            # All-reduce to combine results
+            dist.all_reduce(full_output, op=dist.ReduceOp.SUM)
+            
+            # Reshape if needed
+            if len(orig_shape) > 2:
+                full_output = full_output.view(*orig_shape[:-1], self.out_features)
                 
-                # All-reduce each tensor separately
-                for i in range(self.world_size):
-                    dist.all_reduce(output_list[i], op=dist.ReduceOp.SUM)
-                
-                # Concatenate results
-                output = torch.cat(output_list, dim=-1)
-                return output
-                    
-            except Exception as e:
-                print(f"Error in ParallelLinear all_gather on rank {self.rank}:")
-                print(f"Local output shape: {local_out.shape}")
-                print(f"World size: {self.world_size}")
-                raise e
-        else:
-            return local_out
+            return full_output

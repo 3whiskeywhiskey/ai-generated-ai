@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from .parallel_utils import ParallelLinear, RowParallelLinear
 
@@ -93,57 +94,39 @@ class MultiHeadAttention(nn.Module):
         return output
         
     def forward(self, x, mask=None):
+        batch_size, seq_len, _ = x.shape
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        batch_size, seq_len, _ = x.size()
         
-        # Project queries, keys, values
+        # Project to Q, K, V - each projection splits across GPUs
         q = self.q_proj(x)  # [batch, seq, d_model_per_rank]
         k = self.k_proj(x)
         v = self.v_proj(x)
         
-        self._debug_shape(q, "After projection", rank)
+        # Reshape and transpose for attention
+        # [batch, seq, n_heads_per_rank * d_head] -> [batch, n_heads_per_rank, seq, d_head]
+        q = q.view(batch_size, seq_len, self.n_heads_per_rank, self.d_head).transpose(1, 2).contiguous()
+        k = k.view(batch_size, seq_len, self.n_heads_per_rank, self.d_head).transpose(1, 2).contiguous()
+        v = v.view(batch_size, seq_len, self.n_heads_per_rank, self.d_head).transpose(1, 2).contiguous()
         
-        # Verify projection output dimensions
-        assert q.size(-1) == self.d_model_per_rank, \
-            f"Projection output size {q.size(-1)} != expected {self.d_model_per_rank}"
+        # Compute attention scores
+        # [batch, n_heads_per_rank, seq, seq]
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_head)
         
-        # First reshape to separate heads
-        q = q.reshape(batch_size, seq_len, self.n_heads_per_rank, self.d_head)
-        k = k.reshape(batch_size, seq_len, self.n_heads_per_rank, self.d_head)
-        v = v.reshape(batch_size, seq_len, self.n_heads_per_rank, self.d_head)
+        if mask is not None:
+            attn_weights = attn_weights.masked_fill(mask.unsqueeze(1) == 0, float('-inf'))
         
-        self._debug_shape(q, "After first reshape", rank)
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_weights = self.dropout(attn_weights)
         
-        # Then transpose seq_len and n_heads
-        q = q.transpose(1, 2).contiguous()  # [batch, n_heads_per_rank, seq, d_head]
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
+        # Apply attention to values
+        # [batch, n_heads_per_rank, seq, d_head]
+        attn_output = torch.matmul(attn_weights, v)
         
-        self._debug_shape(q, "After transpose", rank)
-        
-        # Prepare attention mask
-        mask = self._prepare_mask(mask, batch_size, self.n_heads_per_rank, seq_len, rank)
-        
-        # Compute attention with explicit dimension handling
-        attn_output = self._scaled_dot_product_attention(q, k, v, mask)
-        self._debug_shape(attn_output, "After attention", rank)
-        
-        # Transpose back: [batch, n_heads_per_rank, seq, d_head] -> [batch, seq, n_heads_per_rank, d_head]
+        # Reshape: [batch, n_heads_per_rank, seq, d_head] -> [batch, seq, n_heads_per_rank * d_head]
         attn_output = attn_output.transpose(1, 2).contiguous()
-        self._debug_shape(attn_output, "After transpose back", rank)
+        attn_output = attn_output.view(batch_size, seq_len, self.n_heads_per_rank * self.d_head)
         
-        # Merge heads: [batch, seq, n_heads_per_rank, d_head] -> [batch, seq, d_model_per_rank]
-        attn_output = attn_output.reshape(batch_size, seq_len, self.n_heads_per_rank * self.d_head)
-        self._debug_shape(attn_output, "After final reshape", rank)
-        
-        # Verify final shape before projection
-        expected_size = batch_size * seq_len * self.d_model_per_rank
-        actual_size = attn_output.numel()
-        assert expected_size == actual_size, \
-            f"Size mismatch before projection: expected {expected_size}, got {actual_size}"
-        
-        # Final output projection - uses row parallelism to handle distributed input
+        # Final output projection
         attn_output = self.out_proj(attn_output)  # [batch, seq, d_model]
-        self._debug_shape(attn_output, "After projection", rank)
         
         return attn_output
