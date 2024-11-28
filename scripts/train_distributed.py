@@ -6,13 +6,17 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from transformers import get_linear_schedule_with_warmup
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 import wandb
 import argparse
 from datetime import datetime, timedelta
 import random
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from transformers import AutoTokenizer
+from datasets import load_dataset
+from torch.utils.data import DataLoader
 
 # Add project root to Python path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -20,6 +24,36 @@ sys.path.append(project_root)
 
 from src.llm_project.model.model import GPTModel
 from src.llm_project.data.dataset import create_dataloaders
+
+class ResumeDistributedSampler(DistributedSampler):
+    """DistributedSampler that supports starting from a specific index."""
+    
+    def __init__(self, dataset, num_replicas=None, rank=None, shuffle=True, seed=0):
+        super().__init__(dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle, seed=seed)
+        self.start_index = 0
+    
+    def set_start_index(self, start_index):
+        """Set the starting index for the sampler."""
+        self.start_index = start_index
+    
+    def __iter__(self):
+        if self.shuffle:
+            # deterministically shuffle based on epoch and seed
+            g = torch.Generator()
+            g.manual_seed(self.epoch + self.seed)
+            indices = torch.randperm(len(self.dataset), generator=g).tolist()
+        else:
+            indices = list(range(len(self.dataset)))
+
+        # Add extra samples to make it evenly divisible
+        indices += indices[:(self.total_size - len(indices))]
+        assert len(indices) == self.total_size
+
+        # Subsample based on rank and start index
+        start_idx = self.start_index * self.num_replicas + self.rank
+        indices = indices[start_idx:self.total_size:self.num_replicas]
+        
+        return iter(indices)
 
 def print_gpu_topology():
     """Print detailed GPU topology information."""
@@ -117,20 +151,25 @@ def find_latest_checkpoint(checkpoint_dir):
         
     checkpoints = []
     for f in os.listdir(checkpoint_dir):
-        if f.startswith('checkpoint_step_') and f.endswith('.pt'):
+        if f.endswith('.pt') and (f.startswith('checkpoint_step_') or f.startswith('checkpoint_epoch_')):
             try:
-                step = int(f.split('_')[2].split('.')[0])
-                checkpoints.append((step, os.path.join(checkpoint_dir, f)))
+                checkpoint_path = os.path.join(checkpoint_dir, f)
+                # Load checkpoint to get actual step number
+                checkpoint = torch.load(checkpoint_path, map_location='cpu')
+                actual_step = checkpoint['step']
+                checkpoints.append((actual_step, checkpoint_path))
             except:
                 continue
     
     if not checkpoints:
         return None
-        
+    
+    # Sort by actual step number and return the latest
     latest_checkpoint = sorted(checkpoints, key=lambda x: x[0])[-1]
+    print(f"Found latest checkpoint at step {latest_checkpoint[0]}: {latest_checkpoint[1]}")
     return latest_checkpoint[1]
 
-def save_checkpoint(model, optimizer, scheduler, epoch, step, loss, checkpoint_dir, is_main_process=False):
+def save_checkpoint(model, optimizer, scheduler, epoch, step, loss, checkpoint_dir, is_main_process=False, is_best=False, is_epoch=False):
     """Save model checkpoint."""
     if not is_main_process:
         return
@@ -152,210 +191,399 @@ def save_checkpoint(model, optimizer, scheduler, epoch, step, loss, checkpoint_d
         'loss': loss
     }
     
-    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_step_{step}.pt')
+    # Save step checkpoint
+    if is_epoch:
+        checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
+    else:
+        checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_step_{step}.pt')
     torch.save(checkpoint, checkpoint_path)
     print(f"Saved checkpoint to {checkpoint_path}")
+    
+    # Save best checkpoint if specified
+    if is_best:
+        best_path = os.path.join(checkpoint_dir, 'checkpoint_best.pt')
+        torch.save(checkpoint, best_path)
+        print(f"Saved best checkpoint to {best_path}")
 
 def load_checkpoint(model, optimizer, scheduler, checkpoint_path, rank):
     """Load model checkpoint."""
-    # Load checkpoint to CPU first to avoid GPU RAM issues
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    if rank == 0:
+        print(f"  Loading checkpoint from {checkpoint_path}")
+    
+    # Load checkpoint to CPU first, with weights_only=True for security
+    if rank == 0:
+        print("  Loading state dict...")
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+    
+    # Remap state dict keys if needed
+    if rank == 0:
+        print("  Remapping state dict keys...")
+    state_dict = checkpoint['model_state_dict']
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if 'ff.' in k and '.linear.' not in k:
+            parts = k.split('.')
+            # Insert 'linear' before 'weight' or 'bias'
+            new_parts = parts[:-1] + ['linear'] + [parts[-1]]
+            new_k = '.'.join(new_parts)
+            new_state_dict[new_k] = v
+        else:
+            new_state_dict[k] = v
     
     # Load model state
+    if rank == 0:
+        print("  Loading model state...")
     if isinstance(model, DDP):
-        model.module.load_state_dict(checkpoint['model_state_dict'])
+        model.module.load_state_dict(new_state_dict)
     else:
-        model.load_state_dict(checkpoint['model_state_dict'])
+        model.load_state_dict(new_state_dict)
     
-    # Load optimizer and scheduler states on the appropriate device
+    # Move optimizer states to correct device
+    if rank == 0:
+        print("  Loading optimizer state...")
     optimizer_state = checkpoint['optimizer_state_dict']
     for state in optimizer_state['state'].values():
         for k, v in state.items():
             if isinstance(v, torch.Tensor):
-                state[k] = v.to(rank)
+                state[k] = v.cuda(rank)
     optimizer.load_state_dict(optimizer_state)
     
     if scheduler and checkpoint['scheduler_state_dict']:
+        if rank == 0:
+            print("  Loading scheduler state...")
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     
-    return checkpoint['epoch'], checkpoint['step']
+    # Calculate correct epoch from step number
+    steps_per_epoch = len(train_loader) // train_config['grad_acc_steps']
+    epoch = checkpoint['step'] // steps_per_epoch
+    
+    if rank == 0:
+        print(f"  Loaded checkpoint from step {checkpoint['step']} (epoch {epoch})")
+    
+    return epoch, checkpoint['step']
 
 def train(rank, world_size, model_config, train_config):
     """Training function for each process."""
     setup_distributed(rank, world_size)
+    torch.manual_seed(42 + rank)
+    
+    # Set debug level for distributed training
+    if rank == 0:
+        os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'DETAIL'
     
     # Create model and move to GPU
     model = GPTModel(**model_config)
     device = f'cuda:{rank}'
     model = model.to(device)
     
+    # Initialize wandb on rank 0 only
     if rank == 0:
-        print("\nModel Configuration:")
-        print(f"Vocab Size: {model_config['vocab_size']}")
-        print(f"Embedding Dim: {model_config['n_embd']}")
-        print(f"Num Layers: {model_config['n_layer']}")
-        print(f"Num Heads: {model_config['n_head']}")
-        print(f"Max Sequence Length: {model_config['max_seq_len']}")
-        
-        # Check initial weights
-        print("\nInitial weight stats:")
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                print(f"{name}: mean={param.data.mean().item():.3f}, std={param.data.std().item():.3f}")
+        total_params = sum(p.numel() for p in model.parameters())
+        wandb.init(
+            project="llm-project",
+            config={
+                "model_config": model_config,
+                "train_config": train_config,
+                "world_size": world_size,
+                "effective_batch_size": train_config['batch_size'] * world_size * train_config['grad_acc_steps'],
+                "total_params": total_params,
+            },
+            name=f"distributed_train_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            resume=True  # Allow wandb to resume from previous run
+        )
     
-    # Wrap model for distributed training
-    model = DDP(model, device_ids=[rank])
+    # Print model size and initial stats on rank 0
+    if rank == 0:
+        print(f"\nModel size: {total_params:,} parameters")
     
-    # Create optimizer
-    optimizer = torch.optim.AdamW(
+    # Wrap model with DDP, using static graph optimization
+    model = DDP(
+        model,
+        device_ids=[rank],
+        find_unused_parameters=False,
+        broadcast_buffers=False
+    )
+    model._set_static_graph()
+    
+    # Create optimizer and scheduler
+    optimizer = AdamW(
         model.parameters(),
         lr=train_config['learning_rate'],
         weight_decay=train_config['weight_decay']
     )
     
-    # Create dataloaders
+    # Create dataloaders with fixed batch size
     train_loader, val_loader, train_sampler = create_dataloaders(
         batch_size=train_config['batch_size'],
         max_length=model_config['max_seq_len']
     )
     
-    # Training loop
-    global_step = 0
-    optimizer.zero_grad()
+    # Create scheduler
+    scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=len(train_loader) * train_config['max_epochs'] // train_config['grad_acc_steps']
+    )
     
-    for epoch in range(train_config['max_epochs']):
-        if train_sampler:
-            train_sampler.set_epoch(epoch)
+    # Calculate steps per epoch
+    steps_per_epoch = len(train_loader) // train_config['grad_acc_steps']
+    
+    # Load checkpoint if available
+    start_epoch = 0
+    global_step = 0
+    steps_this_epoch = 0
+    best_val_loss = float('inf')
+    checkpoint_path = find_latest_checkpoint(train_config['checkpoint_dir'])
+    
+    if checkpoint_path:
+        if rank == 0:
+            print(f"\nLoading checkpoint: {checkpoint_path}")
+        
+        # Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+        
+        # Calculate correct epoch from step number
+        global_step = checkpoint['step']
+        steps_per_epoch = len(train_loader) // train_config['grad_acc_steps']
+        start_epoch = (global_step // steps_per_epoch) - 1  # Subtract 1 to make it 0-based
+        steps_this_epoch = (global_step % steps_per_epoch) * train_config['grad_acc_steps']
+        
+        # Load model state
+        if isinstance(model, DDP):
+            model.module.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Load optimizer state
+        optimizer_state = checkpoint['optimizer_state_dict']
+        for state in optimizer_state['state'].values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.cuda(rank)
+        optimizer.load_state_dict(optimizer_state)
+        
+        # Load scheduler state
+        if scheduler and checkpoint['scheduler_state_dict']:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # Adjust scheduler steps
+        for _ in range(global_step):
+            scheduler.step()
+            
+        if rank == 0:
+            print(f"Resuming from step {global_step} (epoch {start_epoch})")
+            print(f"Starting at step {steps_this_epoch}/{len(train_loader)} in current epoch")
+    elif rank == 0:
+        print("\nStarting training from scratch")
+    
+    if rank == 0:
+        print(f"\nTraining Configuration:")
+        print(f"Learning Rate: {train_config['learning_rate']}")
+        print(f"Weight Decay: {train_config['weight_decay']}")
+        print(f"Batch Size per GPU: {train_config['batch_size']}")
+        print(f"Effective Batch Size: {train_config['batch_size'] * world_size * train_config['grad_acc_steps']}")
+        print(f"Gradient Accumulation Steps: {train_config['grad_acc_steps']}")
+        print(f"Starting from epoch {start_epoch}, step {global_step}")
+        print(f"Using static graph optimization")
+    
+    # Training loop
+    for epoch in range(start_epoch, train_config['max_epochs']):
+        if rank == 0:
+            print(f"\nProcess {rank}: Starting epoch {epoch}")
+        
+        # Set epoch and start index for sampler
+        train_sampler.set_epoch(epoch)
+        if steps_this_epoch > 0:
+            if rank == 0:
+                print(f"Process {rank}: Setting start index to {steps_this_epoch}")
+            train_sampler.set_start_index(steps_this_epoch)
+        else:
+            train_sampler.set_start_index(0)
+        
+        if rank == 0:
+            print(f"Process {rank}: Creating progress bar...")
+        progress = tqdm(
+            total=len(train_loader),
+            initial=steps_this_epoch,
+            desc=f"Training Epoch {epoch}",
+            disable=rank != 0
+        )
         
         model.train()
-        progress_bar = tqdm(total=len(train_loader), disable=rank != 0)
+        running_loss = 0
+        optimizer.zero_grad()
         
-        for batch_idx, batch in enumerate(train_loader):
+        # Start training from the correct step
+        for batch_idx, batch in enumerate(train_loader, start=steps_this_epoch):
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
             
             # Forward pass
             outputs = model(input_ids=input_ids, labels=labels)
-            loss = outputs.loss
+            loss = outputs.loss / train_config['grad_acc_steps']
             
-            # Debug first batch
+            # Debug first batch of first epoch
             if rank == 0 and global_step == 0:
-                print("\nFirst batch debug:")
+                logits = outputs.logits
+                print("\nFirst batch analysis:")
                 print(f"Input shape: {input_ids.shape}")
                 print(f"Labels shape: {labels.shape}")
-                print(f"Labels min/max: {labels.min().item()}, {labels.max().item()}")
-                print(f"Output type: {type(outputs)}")
-                print(f"Loss: {loss.item():.3f}")
-                print(f"Loss requires grad: {loss.requires_grad}")
-                
-                # Check logits
-                logits = outputs.logits
-                print(f"\nLogits stats:")
                 print(f"Logits shape: {logits.shape}")
-                print(f"Logits mean/std: {logits.mean().item():.3f}, {logits.std().item():.3f}")
-                probs = torch.softmax(logits[:, 0], dim=-1)  # Look at first position
-                print(f"Probs mean/std: {probs.mean().item():.3f}, {probs.std().item():.3f}")
-                print(f"Max prob: {probs.max().item():.3f}")
+                print(f"Logits mean/std: {logits.mean().item():.6f}/{logits.std().item():.6f}")
+                print(f"Loss: {loss.item() * train_config['grad_acc_steps']:.6f}")
                 
-                # Check parameters
-                print("\nParameter stats:")
-                for name, param in model.named_parameters():
-                    if param.requires_grad:
-                        print(f"{name}: mean={param.data.mean().item():.3f}, std={param.data.std().item():.3f}")
-            
-            # Scale loss for gradient accumulation
-            loss = loss / train_config['grad_acc_steps']
+                print("\nSample logits from first sequence:")
+                print(logits[0, 0, :10].tolist())
+                
+                print("\nLabel statistics:")
+                print(f"Label range: {labels.min().item()} to {labels.max().item()}")
+                print(f"Unique labels: {torch.unique(labels).tolist()}")
             
             # Backward pass
             loss.backward()
             
-            # Monitor gradients
-            if rank == 0 and (global_step == 0 or global_step % 100 == 99):
-                total_norm = 0.0
-                for name, param in model.named_parameters():
-                    if param.grad is not None:
-                        param_norm = param.grad.data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** 0.5
-                print(f"\nStep {global_step} gradient norm: {total_norm:.3f}")
-            
-            # Gradient accumulation and optimization step
-            if (batch_idx + 1) % train_config['grad_acc_steps'] == 0:
-                if train_config.get('max_grad_norm', None):
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        train_config['max_grad_norm']
-                    )
+            # Update weights every grad_acc_steps or at the end of epoch
+            if (batch_idx + 1) % train_config['grad_acc_steps'] == 0 or (batch_idx + 1) == len(train_loader):
+                # Clip gradients
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 
+                # Optimizer and scheduler step
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad()
                 
-                # Update progress bar
-                if rank == 0:
-                    progress_bar.set_postfix({
-                        'loss': loss.item() * train_config['grad_acc_steps'],
-                        'lr': train_config['learning_rate'],
-                        'global_step': global_step
-                    })
-                    progress_bar.update(train_config['grad_acc_steps'])
-                
+                # Increment global step
                 global_step += 1
                 
-                # Save checkpoint
+                # Save checkpoint every N steps
                 if rank == 0 and global_step % train_config['save_steps'] == 0:
-                    checkpoint_path = os.path.join(
-                        train_config['checkpoint_dir'],
-                        f"checkpoint_step_{global_step}.pt"
+                    save_checkpoint(
+                        model=model.module,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        epoch=epoch,
+                        step=global_step,
+                        loss=loss.item() * train_config['grad_acc_steps'],
+                        checkpoint_dir=train_config['checkpoint_dir'],
+                        is_main_process=True
                     )
-                    torch.save({
-                        'global_step': global_step,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                    }, checkpoint_path)
-                    print(f"\nSaved checkpoint to {checkpoint_path}")
+                
+                # Log training metrics on rank 0
+                if rank == 0:
+                    # Update progress bar
+                    progress.update(train_config['grad_acc_steps'])
+                    progress.set_description(
+                        f"Training Epoch {epoch}: {batch_idx}/{len(train_loader)} "
+                        f"[loss={loss.item() * train_config['grad_acc_steps']:.3f}, "
+                        f"lr={scheduler.get_last_lr()[0]:.6f}, "
+                        f"grad_norm={grad_norm:.3f}]"
+                    )
+                    
+                    # Log to wandb
+                    wandb.log({
+                        'train/loss': loss.item() * train_config['grad_acc_steps'],
+                        'train/learning_rate': scheduler.get_last_lr()[0],
+                        'train/grad_norm': grad_norm,
+                        'train/epoch': epoch,
+                        'train/global_step': global_step,
+                        'train/epoch_progress': batch_idx / len(train_loader)
+                    }, step=global_step)
+            
+            running_loss += (loss.item() * train_config['grad_acc_steps'])
+        
+        # Reset steps_this_epoch for next epoch
+        steps_this_epoch = 0
+        progress.close()
+        
+        avg_train_loss = running_loss / len(train_loader)
+        
+        # Validation phase
+        model.eval()
+        total_val_loss = 0
+        
+        with torch.no_grad():
+            for val_batch in val_loader:
+                val_input_ids = val_batch['input_ids'].to(device)
+                val_labels = val_batch['labels'].to(device)
+                
+                val_outputs = model(val_input_ids, labels=val_labels)
+                val_loss = val_outputs.loss
+                total_val_loss += val_loss.item()
+        
+        avg_val_loss = total_val_loss / len(val_loader)
+        
+        if rank == 0:
+            print(f"\nEpoch {epoch}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}")
+            
+            # Save epoch checkpoint
+            save_checkpoint(
+                model=model.module,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                step=global_step,
+                loss=avg_train_loss,
+                checkpoint_dir=train_config['checkpoint_dir'],
+                is_main_process=True,
+                is_epoch=True
+            )
+            
+            # Log epoch metrics to wandb
+            wandb.log({
+                'epoch/train_loss': avg_train_loss,
+                'epoch/val_loss': avg_val_loss,
+                'epoch': epoch,
+            }, step=global_step)
+            
+            # Save if validation improved
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                save_checkpoint(
+                    model=model.module,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch=epoch,
+                    step=global_step,
+                    loss=avg_val_loss,
+                    checkpoint_dir=train_config['checkpoint_dir'],
+                    is_main_process=True,
+                    is_best=True
+                )
+                
+                # Log best metrics to wandb
+                wandb.run.summary["best_val_loss"] = best_val_loss
+                wandb.run.summary["best_epoch"] = epoch
     
+    # Cleanup
+    if rank == 0:
+        wandb.finish()
     cleanup_distributed()
 
 def main():
-    parser = argparse.ArgumentParser(description='Distributed training for LLM')
-    parser.add_argument('--world_size', type=int, default=None,
-                      help='Number of GPUs to use (default: all available)')
-    args = parser.parse_args()
-    
-    # Model configuration
+    # Model configuration - match single GPU version exactly
     model_config = {
         'vocab_size': 50304,  # GPT-NeoX tokenizer vocab size
-        'n_positions': 32,
-        'max_seq_len': 32,
-        'n_embd': 32,
+        'max_seq_len': 32,    # Reduced from 64
+        'n_positions': 32,    # Same as max_seq_len
         'n_layer': 2,
-        'n_head': 2,
+        'n_head': 2,         # Reduced from 4
+        'n_embd': 32,        # Reduced from 64
         'dropout': 0.1
     }
     
     # Training configuration
     train_config = {
-        'batch_size': 4,
+        'batch_size': 4,      # Per GPU batch size
         'learning_rate': 3e-4,
         'weight_decay': 0.01,
         'max_epochs': 10,
         'checkpoint_dir': 'checkpoints',
         'log_every': 10,
-        'grad_acc_steps': 16,
+        'grad_acc_steps': 16,  # Same as single GPU
         'save_steps': 1000
     }
     
-    # Get world size
-    if args.world_size is None:
-        world_size = torch.cuda.device_count()
-    else:
-        world_size = min(args.world_size, torch.cuda.device_count())
-    
-    if world_size < 2:
-        print("Need at least 2 GPUs for distributed training")
-        return
-    
-    # Launch processes
+    # Launch distributed training
+    world_size = torch.cuda.device_count()
     mp.spawn(
         train,
         args=(world_size, model_config, train_config),

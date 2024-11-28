@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import math
-from .parallel_utils import ParallelLinear
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, n_embd, n_head):
@@ -13,12 +12,12 @@ class MultiHeadAttention(nn.Module):
         self._head_dim = n_embd // n_head
         
         # Create query, key, value projections
-        self.q_proj = ParallelLinear(n_embd, n_embd)
-        self.k_proj = ParallelLinear(n_embd, n_embd)
-        self.v_proj = ParallelLinear(n_embd, n_embd)
+        self.q_proj = nn.Linear(n_embd, n_embd)
+        self.k_proj = nn.Linear(n_embd, n_embd)
+        self.v_proj = nn.Linear(n_embd, n_embd)
         
         # Output projection
-        self.out_proj = ParallelLinear(n_embd, n_embd)
+        self.out_proj = nn.Linear(n_embd, n_embd)
         
         # Dropout
         self.dropout = nn.Dropout(0.1)

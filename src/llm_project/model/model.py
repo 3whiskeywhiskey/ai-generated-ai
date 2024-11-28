@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from .attention import MultiHeadAttention
 from .parallel_utils import ParallelLinear
+import math
 
 class GPTBlock(nn.Module):
     def __init__(self, n_embd, n_head, d_ff, dropout=0.1):
@@ -12,18 +13,21 @@ class GPTBlock(nn.Module):
         self.ff = nn.Sequential(
             ParallelLinear(n_embd, d_ff),
             nn.GELU(),
+            nn.Dropout(dropout),
             ParallelLinear(d_ff, n_embd),
             nn.Dropout(dropout)
         )
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x, mask=None):
-        # Self-attention
-        attn_out = self.attn(self.ln1(x), mask=mask)
-        x = x + self.dropout(attn_out)
+        # Pre-LN architecture
+        attn_ln = self.ln1(x)
+        attn_out = self.attn(attn_ln, mask=mask)
+        x = x + attn_out
         
-        # Feed-forward
-        ff_out = self.ff(self.ln2(x))
+        # Feed-forward with Pre-LN
+        ff_ln = self.ln2(x)
+        ff_out = self.ff(ff_ln)
         x = x + ff_out
         
         return x
@@ -41,6 +45,9 @@ class GPTModel(nn.Module):
     ):
         super().__init__()
         
+        # Store config
+        self.n_embd = n_embd
+        
         # Token and position embeddings
         self.token_embedding = nn.Embedding(vocab_size, n_embd)
         self.position_embedding = nn.Embedding(max_seq_len, n_embd)
@@ -49,7 +56,7 @@ class GPTModel(nn.Module):
         pos_indices = torch.arange(max_seq_len)
         self.register_buffer("pos_indices", pos_indices)
         
-        # Calculate feed-forward dimension (4x embedding dim is standard)
+        # Calculate feed-forward dimension (4x embedding dim)
         d_ff = 4 * n_embd
         
         # Transformer blocks
@@ -60,7 +67,7 @@ class GPTModel(nn.Module):
         
         # Final layer norm and output projection
         self.ln_f = nn.LayerNorm(n_embd)
-        self.output = ParallelLinear(n_embd, vocab_size)
+        self.output = nn.Linear(n_embd, vocab_size)
         
         # Dropout
         self.dropout = nn.Dropout(dropout)
@@ -70,12 +77,21 @@ class GPTModel(nn.Module):
         
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=0.02)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                module.bias.data.zero_()
+            # Use scaled initialization for better gradient flow
+            if isinstance(module, nn.Linear):
+                # Scale linear layers by 1/sqrt(fan_in)
+                fan_in = module.weight.shape[1]
+                std = 0.02 / math.sqrt(fan_in)
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            # Use smaller std for embeddings
+            else:
+                std = 0.01 / math.sqrt(self.n_embd)
+                nn.init.normal_(module.weight, mean=0.0, std=std)
         elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
     
     def forward(self, input_ids, attention_mask=None, labels=None):
         # Get sequence length and create attention mask

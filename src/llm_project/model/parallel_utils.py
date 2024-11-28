@@ -123,17 +123,14 @@ class ParallelLinear(nn.Module):
         local_out = self.linear(x)
         
         if dist.is_initialized():
-            # Create output tensor that maintains gradient information
-            output_shape = list(local_out.shape)
-            output_shape[-1] = self.out_features_per_rank * self.world_size
-            output = torch.zeros(output_shape, dtype=local_out.dtype, device=local_out.device)
+            # Gather outputs from all GPUs
+            output_list = [torch.empty_like(local_out) for _ in range(self.world_size)]
+            dist.all_gather(output_list, local_out)
+            output = torch.cat(output_list, dim=-1)
             
-            # Use scatter to maintain gradient information
-            chunks = list(output.chunk(self.world_size, dim=-1))
-            chunks[self.rank] = local_out
-            
-            # All-reduce to combine outputs
-            dist.all_reduce(output, op=dist.ReduceOp.SUM)
+            # Make sure output requires grad
+            if self.training:
+                output.requires_grad_(True)
         else:
             output = local_out
             
