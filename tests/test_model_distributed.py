@@ -58,13 +58,15 @@ def cleanup_distributed():
 
 def get_model_config():
     """Basic model configuration for tests."""
+    n_embd = 128
     return {
         'vocab_size': 50304,  # GPT-NeoX tokenizer vocab size
         'max_seq_len': 16,
         'n_layer': 2,
         'n_head': 4,
-        'n_embd': 128,
+        'n_embd': n_embd,
         'n_positions': 16,
+        'd_ff': 4 * n_embd,  # Add d_ff parameter
         'dropout': 0.1
     }
 

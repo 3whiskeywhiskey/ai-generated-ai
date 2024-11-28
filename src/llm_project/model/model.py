@@ -41,6 +41,7 @@ class GPTModel(nn.Module):
         n_layer,
         n_head,
         max_seq_len,
+        d_ff=None,
         dropout=0.1
     ):
         super().__init__()
@@ -56,8 +57,9 @@ class GPTModel(nn.Module):
         pos_indices = torch.arange(max_seq_len)
         self.register_buffer("pos_indices", pos_indices)
         
-        # Calculate feed-forward dimension (4x embedding dim)
-        d_ff = 4 * n_embd
+        # Use provided d_ff or calculate it (4x embedding dim)
+        if d_ff is None:
+            d_ff = 4 * n_embd
         
         # Transformer blocks
         self.blocks = nn.ModuleList([

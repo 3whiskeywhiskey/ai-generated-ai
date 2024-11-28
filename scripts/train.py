@@ -35,10 +35,11 @@ def train(rank, world_size, args):
     # Create model
     model = GPTModel(
         vocab_size=50304,  # GPT-NeoX tokenizer vocab size
+        n_positions=args.max_length,
+        n_embd=args.d_model,
+        n_layer=args.n_layers,
+        n_head=args.n_heads,
         max_seq_len=args.max_length,
-        n_layers=args.n_layers,
-        n_heads=args.n_heads,
-        d_model=args.d_model,
         d_ff=args.d_ff,
         dropout=args.dropout
     )

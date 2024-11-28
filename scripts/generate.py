@@ -2,6 +2,7 @@ import os
 import sys
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import argparse
 from transformers import AutoTokenizer
 from tqdm import tqdm
@@ -10,100 +11,7 @@ from tqdm import tqdm
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 
-from src.llm_project.model.model import GPTModel as BaseGPTModel
-from src.llm_project.model.attention import MultiHeadAttention
-
-class CustomLinear(nn.Module):
-    """Custom linear layer that exposes weight and bias directly."""
-    def __init__(self, in_features, out_features):
-        super().__init__()
-        self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.02)
-        self.bias = nn.Parameter(torch.zeros(out_features))
-    
-    def forward(self, x):
-        return F.linear(x, self.weight, self.bias)
-
-class GPTBlock(nn.Module):
-    def __init__(self, n_embd, n_head, d_ff, dropout=0.1):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.attn = MultiHeadAttention(n_embd, n_head)
-        self.ln2 = nn.LayerNorm(n_embd)
-        
-        # Create feed-forward network with named submodules to match checkpoint
-        self.ff = nn.ModuleDict({
-            '0': CustomLinear(n_embd, d_ff),
-            '3': CustomLinear(d_ff, n_embd)
-        })
-        
-        self.gelu = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, x, mask=None):
-        # Attention block
-        attn_ln = self.ln1(x)
-        attn_out = self.attn(attn_ln, mask=mask)
-        x = x + attn_out
-        
-        # Feed-forward block
-        ff_ln = self.ln2(x)
-        ff_mid = self.dropout(self.gelu(self.ff['0'](ff_ln)))
-        ff_out = self.dropout(self.ff['3'](ff_mid))
-        x = x + ff_out
-        
-        return x
-
-class GPTModel(BaseGPTModel):
-    def __init__(self, vocab_size, n_positions, n_embd, n_layer, n_head, max_seq_len, d_ff=None, dropout=0.1):
-        # Call parent's init without creating blocks
-        nn.Module.__init__(self)
-        
-        # Store config
-        self.n_embd = n_embd
-        
-        # Token and position embeddings
-        self.token_embedding = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding = nn.Embedding(max_seq_len, n_embd)
-        
-        # Register buffer for positional indices
-        pos_indices = torch.arange(max_seq_len)
-        self.register_buffer("pos_indices", pos_indices)
-        
-        # Use provided d_ff or calculate default
-        if d_ff is None:
-            d_ff = 4 * n_embd
-        
-        # Transformer blocks with custom d_ff
-        self.blocks = nn.ModuleList([
-            GPTBlock(n_embd, n_head, d_ff, dropout)
-            for _ in range(n_layer)
-        ])
-        
-        # Final layer norm and output projection
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.output = nn.Linear(n_embd, vocab_size)
-        
-        # Dropout
-        self.dropout = nn.Dropout(dropout)
-
-def remap_state_dict(state_dict):
-    """Remap state dict keys to match model structure."""
-    new_state_dict = {}
-    
-    for k, v in state_dict.items():
-        # Handle feed-forward layers
-        if '.ff.' in k:
-            if 'linear.weight' in k:
-                new_k = k.replace('.linear.weight', '.weight')
-            elif 'linear.bias' in k:
-                new_k = k.replace('.linear.bias', '.bias')
-            else:
-                new_k = k
-        else:
-            new_k = k
-        new_state_dict[new_k] = v
-    
-    return new_state_dict
+from src.llm_project.model.model import GPTModel
 
 def load_model(checkpoint_path, device='cuda'):
     """Load model from checkpoint."""
@@ -134,13 +42,10 @@ def load_model(checkpoint_path, device='cuda'):
         n_head = state_dict[attn_key].shape[0] // n_embd
         max_seq_len = state_dict['position_embedding.weight'].shape[0]
         
-        # Get feed-forward dimensions from checkpoint
-        ff_in_key = next(k for k in state_dict.keys() if k.startswith('blocks.0.ff.0.linear.weight'))
-        ff_out_key = next(k for k in state_dict.keys() if k.startswith('blocks.0.ff.3.linear.weight'))
-        
-        # Get dimensions from both layers
-        d_ff_in = state_dict[ff_in_key].shape[0]  # First layer expands
-        d_ff_out = state_dict[ff_out_key].shape[1]  # Last layer contracts
+        # Get FF layer dimensions from checkpoint
+        ff_second_key = next(k for k in state_dict.keys() if k.startswith('blocks.0.ff.3.linear.weight'))
+        ff_second_weight = state_dict[ff_second_key]
+        d_ff = ff_second_weight.shape[1]  # Get d_ff from second layer input dimension
         
         config = {
             'vocab_size': vocab_size,
@@ -149,22 +54,54 @@ def load_model(checkpoint_path, device='cuda'):
             'n_layer': n_layer,
             'n_head': n_head,
             'n_embd': n_embd,
-            'd_ff': d_ff_in,  # Use the expansion dimension
+            'd_ff': d_ff,
             'dropout': 0.1
         }
-        
-        print("\nInferred model config:")
-        for k, v in config.items():
-            print(f"{k}: {v}")
+    
+    print("\nInferred model config:")
+    for k, v in config.items():
+        print(f"{k}: {v}")
     
     # Create model and load state
     print("\nCreating model with inferred config...")
     model = GPTModel(**config)
     
-    # Remap state dict keys and load
-    print("Remapping state dict keys...")
-    remapped_state_dict = remap_state_dict(checkpoint['model_state_dict'])
-    model.load_state_dict(remapped_state_dict)
+    # Reconstruct full weights from DDP-split weights
+    state_dict = checkpoint['model_state_dict']
+    new_state_dict = {}
+    
+    for k, v in state_dict.items():
+        if 'ff.0.linear.weight' in k:
+            # First FF layer was split across GPUs (output dim was split)
+            # Original shape: [32, 32] x 4 GPUs = [128, 32]
+            new_shape = (d_ff, v.shape[1])
+            new_v = torch.zeros(new_shape, device=v.device)
+            new_v[:v.shape[0]] = v
+            new_state_dict[k] = new_v
+        elif 'ff.0.linear.bias' in k:
+            # Bias was also split
+            new_shape = (d_ff,)
+            new_v = torch.zeros(new_shape, device=v.device)
+            new_v[:v.shape[0]] = v
+            new_state_dict[k] = new_v
+        elif 'ff.3.linear.weight' in k:
+            # Second FF layer was split across GPUs (input dim was split)
+            # Original shape: [8, 128] x 4 GPUs = [32, 128]
+            new_shape = (n_embd, v.shape[1])
+            new_v = torch.zeros(new_shape, device=v.device)
+            new_v[:v.shape[0]] = v
+            new_state_dict[k] = new_v
+        elif 'ff.3.linear.bias' in k:
+            # Bias was also split
+            new_shape = (n_embd,)
+            new_v = torch.zeros(new_shape, device=v.device)
+            new_v[:v.shape[0]] = v
+            new_state_dict[k] = new_v
+        else:
+            new_state_dict[k] = v
+    
+    print("Loading state dict...")
+    model.load_state_dict(new_state_dict)
     
     model = model.to(device)
     model.eval()
@@ -199,13 +136,7 @@ def generate(
             outputs = model(generated[:, -max_seq_len:])  # Only use last max_seq_len tokens
             
             # Get logits from outputs
-            if isinstance(outputs, dict):
-                logits = outputs.logits
-            else:
-                logits = outputs
-            
-            # Get next token logits (last token only)
-            next_token_logits = logits[:, -1, :].float()
+            next_token_logits = outputs['logits'][:, -1, :].float()
             
             # Apply temperature
             if temperature != 1.0:

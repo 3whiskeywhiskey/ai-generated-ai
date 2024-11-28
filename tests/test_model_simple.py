@@ -6,13 +6,15 @@ import pytest
 @pytest.fixture
 def model_setup():
     """Fixture to set up model and inputs"""
+    n_embd = 512
     config = ModelConfig(
         n_layer=2,
         n_head=8,
-        n_embd=512,
+        n_embd=n_embd,
         n_positions=128,
         vocab_size=1000,
-        max_seq_len=128
+        max_seq_len=128,
+        d_ff=4 * n_embd
     )
     
     model = GPTModel(
@@ -22,6 +24,7 @@ def model_setup():
         n_layer=config.n_layer,
         n_head=config.n_head,
         max_seq_len=config.max_seq_len,
+        d_ff=config.d_ff,
         dropout=config.dropout
     )
     

@@ -16,4 +16,5 @@ class ModelConfig:
     pad_token_id: int = 0
     bos_token_id: int = 1
     eos_token_id: int = 2
-    tie_word_embeddings: bool = True 
+    tie_word_embeddings: bool = True
+    d_ff: Optional[int] = None  # Feed-forward dimension, defaults to 4 * n_embd if None 
