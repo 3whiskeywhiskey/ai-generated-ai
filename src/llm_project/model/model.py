@@ -2,22 +2,23 @@ import torch
 import torch.nn as nn
 from .attention import MultiHeadAttention
 from .parallel_utils import ParallelLinear
+from .config import ModelConfig
 import math
 
 class GPTBlock(nn.Module):
-    def __init__(self, n_embd, n_head, d_ff, dropout=0.1):
+    def __init__(self, config: ModelConfig):
         super().__init__()
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.attn = MultiHeadAttention(n_embd, n_head)
-        self.ln2 = nn.LayerNorm(n_embd)
+        self.ln1 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
+        self.attn = MultiHeadAttention(config.n_embd, config.n_head)
+        self.ln2 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
         self.ff = nn.Sequential(
-            ParallelLinear(n_embd, d_ff),
+            ParallelLinear(config.n_embd, config.d_ff),
             nn.GELU(),
-            nn.Dropout(dropout),
-            ParallelLinear(d_ff, n_embd),
-            nn.Dropout(dropout)
+            nn.Dropout(config.dropout),
+            ParallelLinear(config.d_ff, config.n_embd),
+            nn.Dropout(config.dropout)
         )
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(config.dropout)
         
     def forward(self, x, mask=None):
         # Pre-LN architecture
@@ -35,124 +36,111 @@ class GPTBlock(nn.Module):
 class GPTModel(nn.Module):
     def __init__(
         self,
-        vocab_size,
-        n_positions,
-        n_embd,
-        n_layer,
-        n_head,
-        max_seq_len,
+        vocab_size=None,
+        max_seq_len=None,
+        n_embd=None,
+        n_layer=None,
+        n_head=None,
         d_ff=None,
-        dropout=0.1
+        dropout=None,
+        config: ModelConfig = None,
+        gradient_checkpointing=True  # Enable by default
     ):
         super().__init__()
         
+        # Use provided config or create one from parameters
+        if config is None:
+            config = ModelConfig(
+                vocab_size=vocab_size,
+                max_seq_len=max_seq_len,
+                n_embd=n_embd,
+                n_layer=n_layer,
+                n_head=n_head,
+                d_ff=d_ff,
+                dropout=dropout
+            )
+        self.config = config
+        
         # Store config
-        self.n_embd = n_embd
+        self.n_embd = config.n_embd
+        self.gradient_checkpointing = gradient_checkpointing
         
         # Token and position embeddings
-        self.token_embedding = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding = nn.Embedding(max_seq_len, n_embd)
+        self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
+        self.position_embedding = nn.Embedding(config.max_seq_len, config.n_embd)
         
         # Register buffer for positional indices
-        pos_indices = torch.arange(max_seq_len)
+        pos_indices = torch.arange(config.max_seq_len)
         self.register_buffer("pos_indices", pos_indices)
-        
-        # Use provided d_ff or calculate it (4x embedding dim)
-        if d_ff is None:
-            d_ff = 4 * n_embd
         
         # Transformer blocks
         self.blocks = nn.ModuleList([
-            GPTBlock(n_embd, n_head, d_ff, dropout)
-            for _ in range(n_layer)
+            GPTBlock(config)
+            for _ in range(config.n_layer)
         ])
         
         # Final layer norm and output projection
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.output = nn.Linear(n_embd, vocab_size)
+        self.ln_f = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
+        self.output = nn.Linear(config.n_embd, config.vocab_size)
         
         # Dropout
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(config.dropout)
         
         # Initialize weights
         self.apply(self._init_weights)
         
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            # Use scaled initialization for better gradient flow
-            if isinstance(module, nn.Linear):
-                # Scale linear layers by 1/sqrt(fan_in)
-                fan_in = module.weight.shape[1]
-                std = 0.02 / math.sqrt(fan_in)
-                nn.init.normal_(module.weight, mean=0.0, std=std)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            # Use smaller std for embeddings
-            else:
-                std = 0.01 / math.sqrt(self.n_embd)
-                nn.init.normal_(module.weight, mean=0.0, std=std)
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+        
+        # Scale output layer initialization
+        if isinstance(module, nn.Linear) and module.weight.shape[0] == self.config.vocab_size:
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layer))
     
     def forward(self, input_ids, attention_mask=None, labels=None):
-        # Get sequence length and create attention mask
-        batch_size, seq_len = input_ids.size()
-        
-        # Create causal mask [seq_len, seq_len]
-        causal_mask = torch.triu(
-            torch.ones((seq_len, seq_len), dtype=torch.bool, device=input_ids.device),
-            diagonal=1
-        )
-        
-        # Combine with attention mask if provided
-        if attention_mask is not None:
-            # Convert attention_mask to float and unsqueeze for broadcasting
-            attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [batch_size, 1, 1, seq_len]
-            attention_mask = (1.0 - attention_mask) * torch.finfo(torch.float32).min
-            
-            # Combine with causal mask
-            causal_mask = causal_mask.unsqueeze(0)  # [1, seq_len, seq_len]
-            combined_mask = causal_mask | (attention_mask == torch.finfo(torch.float32).min)
-        else:
-            combined_mask = causal_mask
-        
         # Get embeddings
-        token_embeds = self.token_embedding(input_ids)  # [batch_size, seq_len, d_model]
-        pos_embeds = self.position_embedding(self.pos_indices[:seq_len])  # [seq_len, d_model]
+        b, t = input_ids.size()
+        pos = self.pos_indices[:t]
         
-        # Combine embeddings
-        x = self.dropout(token_embeds + pos_embeds.unsqueeze(0))  # [batch_size, seq_len, d_model]
+        # Token + positional embeddings
+        tok_emb = self.token_embedding(input_ids)
+        pos_emb = self.position_embedding(pos)
+        x = self.dropout(tok_emb + pos_emb)
         
-        # Apply transformer blocks
+        # Apply transformer blocks with optional gradient checkpointing
         for block in self.blocks:
-            x = block(x, mask=combined_mask)
+            if self.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(
+                    block,
+                    x,
+                    attention_mask,
+                    use_reentrant=False
+                )
+            else:
+                x = block(x, attention_mask)
         
-        # Final layer norm and output projection
         x = self.ln_f(x)
-        logits = self.output(x)  # [batch_size, seq_len, vocab_size]
+        logits = self.output(x)
         
-        # Calculate loss if labels are provided
+        # Loss calculation
+        loss = None
         if labels is not None:
-            # Ensure inputs to loss function require gradients
-            logits = logits.view(-1, logits.size(-1))  # [batch_size * seq_len, vocab_size]
-            labels = labels.view(-1)  # [batch_size * seq_len]
+            # Shift logits and labels for next token prediction
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
             
-            # CrossEntropyLoss automatically creates gradients
+            # Flatten the tokens
             loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(logits, labels)
-            
-            # Ensure loss requires gradients
-            if not loss.requires_grad:
-                loss.requires_grad_(True)
-            
-            return type('ModelOutput', (), {
-                'loss': loss,
-                'logits': logits.view(batch_size, seq_len, -1),
-                'hidden_states': x
-            })()
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1)
+            )
         
-        return {
-            'logits': logits,
-            'hidden_states': x
-        }
+        return logits, loss

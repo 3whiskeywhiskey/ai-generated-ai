@@ -3,6 +3,9 @@ import torch.distributed as dist
 from typing import Optional
 import math
 import torch.nn as nn
+import os
+import pynvml
+from torch.utils.data.distributed import DistributedSampler
 
 def initialize_parallel_env():
     """Initialize the distributed environment."""
@@ -135,3 +138,113 @@ class ParallelLinear(nn.Module):
             output = local_out
             
         return output
+
+class ResumeDistributedSampler(DistributedSampler):
+    """DistributedSampler that supports starting from a specific index."""
+    
+    def __init__(self, dataset, num_replicas=None, rank=None, shuffle=True, seed=0):
+        super().__init__(dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle, seed=seed)
+        self.start_index = 0
+    
+    def set_start_index(self, start_index):
+        """Set the starting index for the sampler."""
+        self.start_index = start_index
+    
+    def __iter__(self):
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.epoch + self.seed)
+            indices = torch.randperm(len(self.dataset), generator=g).tolist()
+        else:
+            indices = list(range(len(self.dataset)))
+
+        indices += indices[:(self.total_size - len(indices))]
+        assert len(indices) == self.total_size
+
+        start_idx = self.start_index * self.num_replicas + self.rank
+        indices = indices[start_idx:self.total_size:self.num_replicas]
+        
+        return iter(indices)
+
+def print_gpu_topology():
+    """Print detailed GPU topology information."""
+    try:
+        pynvml.nvmlInit()
+        device_count = pynvml.nvmlDeviceGetCount()
+        
+        print("\nGPU Topology:")
+        for i in range(device_count):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            name = pynvml.nvmlDeviceGetName(handle).decode('utf-8')
+            print(f"\nGPU {i}: {name}")
+            
+            # Check NVLink connections
+            try:
+                for j in range(device_count):
+                    if i != j:
+                        nvlink_status = pynvml.nvmlDeviceGetNvLinkState(handle, j)
+                        if nvlink_status == pynvml.NVML_NVLINK_STATUS_NOT_SUPPORTED:
+                            print(f"  -> GPU {j}: No NVLink support")
+                        else:
+                            nvlink_version = pynvml.nvmlDeviceGetNvLinkVersion(handle, j)
+                            print(f"  -> GPU {j}: NVLink v{nvlink_version}")
+            except pynvml.NVMLError:
+                print(f"  NVLink information not available")
+            
+            # Check P2P capabilities
+            for j in range(device_count):
+                if i != j:
+                    can_access = torch.cuda.can_device_access_peer(i, j)
+                    print(f"  -> GPU {j}: P2P {'Enabled' if can_access else 'Disabled'}")
+        
+        print("\nPCI Topology:")
+        for i in range(device_count):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            pci_info = pynvml.nvmlDeviceGetPciInfo(handle)
+            print(f"GPU {i}: Bus ID {pci_info.busId.decode('utf-8')}")
+            
+    except Exception as e:
+        print(f"Could not detect GPU topology: {str(e)}")
+    print()
+
+def setup_distributed(rank, world_size):
+    """Initialize distributed environment."""
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '29500'
+    
+    os.environ['NCCL_DEBUG'] = 'WARN'
+    os.environ['NCCL_IB_DISABLE'] = '1'
+    os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
+    os.environ['NCCL_P2P_DISABLE'] = '0'
+    os.environ['NCCL_P2P_LEVEL'] = '5'
+    os.environ['NCCL_SOCKET_FAMILY'] = 'AF_INET'
+    os.environ['GLOO_SOCKET_IFNAME'] = 'lo'
+    
+    if rank == 0:
+        print("\nDistributed Configuration:")
+        print(f"MASTER_ADDR: {os.environ['MASTER_ADDR']}")
+        print(f"MASTER_PORT: {os.environ['MASTER_PORT']}")
+        print(f"WORLD_SIZE: {world_size}")
+        print(f"RANK: {rank}")
+        print("\nNCCL Configuration:")
+        for k, v in sorted(os.environ.items()):
+            if k.startswith('NCCL_'):
+                print(f"{k}: {v}")
+        print()
+    
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://localhost:29500",
+        world_size=world_size,
+        rank=rank
+    )
+    
+    torch.cuda.set_device(rank)
+    if rank == 0:
+        print(f"Process {rank}: CUDA device set to {torch.cuda.current_device()}")
+        print(f"Process group initialized successfully!")
+
+def cleanup_distributed():
+    """Clean up distributed environment."""
+    if dist.is_initialized():
+        dist.destroy_process_group()

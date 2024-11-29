@@ -1,0 +1,26 @@
+{
+    "learning_rate": 3e-4,
+    "weight_decay": 0.1,
+    "batch_size": 4,
+    "gradient_accumulation_steps": 16,
+    "num_epochs": 1,
+    "warmup_steps": 2000,
+    "save_every": 500,
+    "checkpoint_dir": "checkpoints",
+    "log_every": 1,
+    "eval_every": 500,
+    "max_grad_norm": 1.0,
+    "use_amp": true,
+    "initial_scale": 16384,
+    "scale_growth_factor": 2,
+    "scale_backoff_factor": 0.5,
+    "scale_growth_interval": 2000,
+    "min_scale": 1,
+    "max_scale": 65536,
+    "zero_optimization": {
+        "stage": 2,
+        "allgather_partitions": true,
+        "reduce_scatter": true,
+        "overlap_comm": true
+    }
+} 

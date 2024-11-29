@@ -6,6 +6,67 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
+import gc
+from contextlib import contextmanager, nullcontext
+from typing import Optional
+
+def clear_cuda_cache(rank: Optional[int] = None):
+    """Force clear CUDA cache and run garbage collection."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        if rank is not None and hasattr(torch.cuda, 'reset_peak_memory_stats'):
+            try:
+                torch.cuda.reset_peak_memory_stats(rank)
+            except RuntimeError:
+                pass  # Ignore if device not initialized yet
+
+def log_gpu_memory(rank: int, prefix: str = "", force_clear: bool = True):
+    """Log memory stats for current GPU with optional cache clearing."""
+    if rank != 0:  # Only log on main process
+        return
+        
+    if force_clear:
+        clear_cuda_cache(rank)
+    
+    try:
+        allocated = torch.cuda.memory_allocated(rank) / (1024 * 1024 * 1024)  # GB
+        reserved = torch.cuda.memory_reserved(rank) / (1024 * 1024 * 1024)    # GB
+        max_allocated = torch.cuda.max_memory_allocated(rank) / (1024 * 1024 * 1024)  # GB
+        
+        print(f"\n{prefix}GPU {rank} Memory:")
+        print(f"  Current allocated: {allocated:.2f}GB")
+        print(f"  Reserved: {reserved:.2f}GB")
+        print(f"  Peak allocated: {max_allocated:.2f}GB")
+        print(f"  Estimated actual: {allocated + 0.1:.2f}GB")  # Add 0.1GB for CUDA overhead
+    except RuntimeError:
+        print(f"\n{prefix}GPU {rank} Memory: Not initialized yet")
+
+@contextmanager
+def track_memory(rank: int, description: str):
+    """Context manager to track memory usage before and after an operation."""
+    if rank != 0:  # Only track on main process
+        yield
+        return
+        
+    clear_cuda_cache(rank)
+    
+    start_allocated = torch.cuda.memory_allocated(rank) / (1024 * 1024 * 1024)
+    start_reserved = torch.cuda.memory_reserved(rank) / (1024 * 1024 * 1024)
+    
+    yield
+    
+    clear_cuda_cache(rank)
+    
+    end_allocated = torch.cuda.memory_allocated(rank) / (1024 * 1024 * 1024)
+    end_reserved = torch.cuda.memory_reserved(rank) / (1024 * 1024 * 1024)
+    peak_allocated = torch.cuda.max_memory_allocated(rank) / (1024 * 1024 * 1024)
+    
+    print(f"\nMemory Usage - {description}:")
+    print(f"  Start:  {start_allocated:.2f}GB allocated, {start_reserved:.2f}GB reserved")
+    print(f"  End:    {end_allocated:.2f}GB allocated, {end_reserved:.2f}GB reserved")
+    print(f"  Peak:   {peak_allocated:.2f}GB")
+    print(f"  Change: {end_allocated - start_allocated:+.2f}GB allocated")
 
 class Trainer:
     def __init__(

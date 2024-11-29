@@ -50,7 +50,6 @@ def load_model(checkpoint_path, device='cuda'):
         config = {
             'vocab_size': vocab_size,
             'max_seq_len': max_seq_len,
-            'n_positions': max_seq_len,
             'n_layer': n_layer,
             'n_head': n_head,
             'n_embd': n_embd,
@@ -117,26 +116,50 @@ def generate(
     temperature=0.7,
     top_k=50,
     top_p=0.9,
+    min_tokens=10,  # Minimum tokens to generate before allowing EOS
     device='cuda'
 ):
     """Generate text from a prompt."""
     # Tokenize prompt
     input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
+    print(f"Input shape: {input_ids.shape}")
+    print(f"Input tokens: {[tokenizer.decode([t]) for t in input_ids[0].tolist()]}")
     
     # Initialize generation tracking
     generated = input_ids
+    num_generated = 0
     
-    # Get max sequence length from config
-    max_seq_len = 32  # Same as training config
+    # Get max sequence length from model config
+    max_seq_len = model.config.max_seq_len if hasattr(model, 'config') else 1024
+    print(f"Using max_seq_len: {max_seq_len}")
     
     # Generate tokens
     with torch.no_grad():
-        for _ in tqdm(range(max_new_tokens), desc="Generating"):
-            # Get model outputs
-            outputs = model(generated[:, -max_seq_len:])  # Only use last max_seq_len tokens
+        for i in tqdm(range(max_new_tokens), desc="Generating"):
+            # Get model outputs - model returns (logits, cache)
+            current_input = generated[:, -max_seq_len:]
+            print(f"\nStep {i}:")
+            print(f"Current input shape: {current_input.shape}")
             
-            # Get logits from outputs
-            next_token_logits = outputs['logits'][:, -1, :].float()
+            outputs = model(current_input)
+            logits = outputs[0] if isinstance(outputs, tuple) else outputs
+            print(f"Logits shape: {logits.shape}")
+            
+            # Get next token logits from last position
+            next_token_logits = logits[:, -1, :].float()
+            print(f"Next token logits shape: {next_token_logits.shape}")
+            
+            # Print logits statistics before temperature
+            print(f"Logits mean: {next_token_logits.mean():.2f}, std: {next_token_logits.std():.2f}")
+            print(f"Top 5 logits before temperature:")
+            top_logits, top_indices = next_token_logits.topk(5)
+            for logit, idx in zip(top_logits[0], top_indices[0]):
+                print(f"  {tokenizer.decode([idx])} ({idx}): {logit:.2f}")
+            
+            # Prevent EOS before minimum length
+            if num_generated < min_tokens:
+                next_token_logits[0, tokenizer.eos_token_id] = float('-inf')
+                print("Prevented EOS token (minimum length not reached)")
             
             # Apply temperature
             if temperature != 1.0:
@@ -151,7 +174,7 @@ def generate(
             # Apply top-p (nucleus) filtering
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
                 
                 # Remove tokens with cumulative probability above the threshold
                 sorted_indices_to_remove = cumulative_probs > top_p
@@ -163,14 +186,24 @@ def generate(
                 next_token_logits[..., indices_to_remove] = float('-inf')
             
             # Sample next token
-            probs = torch.softmax(next_token_logits, dim=-1)
+            probs = F.softmax(next_token_logits, dim=-1)
+            
+            # Print top probabilities after all filtering
+            print(f"\nTop 5 tokens after filtering:")
+            top_probs, top_indices = probs.topk(5)
+            for prob, idx in zip(top_probs[0], top_indices[0]):
+                print(f"  {tokenizer.decode([idx])} ({idx}): {prob:.4f}")
+            
             next_token = torch.multinomial(probs, num_samples=1)
+            print(f"\nSampled token: {next_token.item()} -> {tokenizer.decode([next_token.item()])}")
             
             # Append to generated
             generated = torch.cat([generated, next_token], dim=-1)
+            num_generated += 1
             
             # Stop if we generate an EOS token
-            if next_token.item() == tokenizer.eos_token_id:
+            if next_token.item() == tokenizer.eos_token_id and num_generated >= min_tokens:
+                print("Generated EOS token after minimum length, stopping")
                 break
     
     # Decode generated tokens
@@ -185,6 +218,7 @@ def main():
     parser.add_argument('--temperature', type=float, default=0.7, help='Sampling temperature')
     parser.add_argument('--top_k', type=int, default=50, help='Top-k filtering value')
     parser.add_argument('--top_p', type=float, default=0.9, help='Top-p (nucleus) filtering value')
+    parser.add_argument('--min_tokens', type=int, default=10, help='Minimum tokens to generate before allowing EOS')
     parser.add_argument('--gpu_id', type=int, default=1, help='GPU ID to use for generation')
     args = parser.parse_args()
     
@@ -222,6 +256,7 @@ def main():
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
+        min_tokens=args.min_tokens,
         device=device
     )
     
